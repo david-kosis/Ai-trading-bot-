@@ -1,12 +1,14 @@
 import argparse
 import logging
+import time
 from datetime import datetime, timezone
 import pandas as pd
 
 from .logging_setup import setup_logging
-from .config import RULES
+from .config import RULES, SETTINGS
 from .broker import BinanceBroker
 from .scanner import CryptoUniverse, gap_scan, save_watchlist
+from .strategy import entry_signal
 from .database import log_event
 from .notify import send
 from .trader import TradeManager
@@ -27,34 +29,76 @@ def scan():
         )
         send(message)
         log.info("Scanned %s symbols; %s candidates", len(symbols), len(rows))
+        return rows
     finally:
         broker.disconnect()
 
 
-def trade_cycle():
+def trade_cycle(manager, broker, trades_today):
+    watch_path = "data/watchlist.csv"
+    try:
+        watch = pd.read_csv(watch_path)
+    except FileNotFoundError:
+        log.warning("No watchlist. Run the scan first.")
+        return trades_today
+
+    max_trades = RULES["entry"]["max_daily_trades"]
+    max_positions = RULES["entry"]["max_concurrent_positions"]
+
+    manager.manage()
+    if trades_today >= max_trades or len(manager.active) >= max_positions:
+        return trades_today
+
+    for symbol in watch["symbol"].head(RULES["universe"]["max_candidates"]):
+        symbol = str(symbol).upper()
+        if symbol in manager.active:
+            continue
+        if trades_today >= max_trades or len(manager.active) >= max_positions:
+            break
+        try:
+            signal = entry_signal(broker, symbol)
+            if not signal:
+                continue
+            log_event("entry_signal", symbol, signal)
+            trade = manager.enter(symbol, signal["price"], signal["day_low"])
+            if trade:
+                trades_today += 1
+                log.info("Entered %s; trades_today=%s", symbol, trades_today)
+        except Exception as exc:
+            log_event("candidate_error", symbol, {"error": str(exc)})
+            log.warning("Candidate evaluation failed for %s: %s", symbol, exc)
+
+    return trades_today
+
+
+def run_bot(interval_seconds=30):
+    """Continuously scan and trade Binance Spot Testnet while paper mode is enabled."""
     broker = BinanceBroker("execution")
+    manager = TradeManager(broker)
+    trades_today = 0
+    day_key = datetime.now(timezone.utc).date()
+
     try:
         broker.connect()
-        manager = TradeManager(broker)
-        now = datetime.now(timezone.utc)
+        log.info("AUTONOMOUS TESTNET BOT STARTED; live=%s", SETTINGS.can_trade_live)
+        while True:
+            now = datetime.now(timezone.utc)
+            if now.date() != day_key:
+                day_key = now.date()
+                trades_today = 0
 
-        # Crypto trades 24/7. This optional UTC force-exit is deliberately
-        # disabled by default; position management can be added later.
-        force_exit = RULES["risk"].get("force_exit_time_utc")
-        if force_exit and now.strftime("%H:%M") >= force_exit:
-            manager.force_close_all()
-            return
+            # Refresh the candidate list each cycle so the bot reacts to new conditions.
+            try:
+                symbols = CryptoUniverse(broker).symbols()
+                rows = gap_scan(broker, symbols)
+                save_watchlist(rows)
+            except Exception as exc:
+                log.warning("Scan cycle failed: %s", exc)
 
-        try:
-            watch = pd.read_csv("data/watchlist.csv")
-        except FileNotFoundError:
-            log.warning("No watchlist. Run the scan first.")
-            return
-
-        for symbol in watch["symbol"].head(RULES["universe"]["max_candidates"]):
-            log_event("candidate_cycle", str(symbol), {"time_utc": now.isoformat()})
-
-        log.info("Trading cycle completed. Entry execution remains gated until strategy conditions pass.")
+            trades_today = trade_cycle(manager, broker, trades_today)
+            time.sleep(interval_seconds)
+    except KeyboardInterrupt:
+        log.info("Bot stopped by user")
     finally:
         broker.disconnect()
 
@@ -62,6 +106,19 @@ def trade_cycle():
 if __name__ == "__main__":
     setup_logging()
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["scan", "trade"], required=True)
+    parser.add_argument("--mode", choices=["scan", "trade", "run"], required=True)
+    parser.add_argument("--interval", type=int, default=30)
     args = parser.parse_args()
-    scan() if args.mode == "scan" else trade_cycle()
+
+    if args.mode == "scan":
+        scan()
+    elif args.mode == "trade":
+        broker = BinanceBroker("execution")
+        try:
+            broker.connect()
+            manager = TradeManager(broker)
+            trade_cycle(manager, broker, 0)
+        finally:
+            broker.disconnect()
+    else:
+        run_bot(args.interval)
