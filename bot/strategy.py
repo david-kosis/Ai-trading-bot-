@@ -3,64 +3,110 @@ import pandas as pd
 from .config import RULES
 
 
-def _daily_context(broker, symbol):
-    daily = pd.DataFrame(broker.historical(symbol, "1d", 220))
-    if len(daily) < 201:
-        return None
-    # Exclude the currently forming daily candle from the SMA/previous-day values.
-    completed = daily.iloc[:-1].copy()
-    prev = completed.iloc[-1]
-    sma200 = completed["close"].tail(200).mean()
-    return {
-        "previous_close": float(prev["close"]),
-        "previous_high": float(prev["high"]),
-        "sma200": float(sma200),
-    }
+def ema(series, period):
+    return series.ewm(span=period, adjust=False).mean()
+
+
+def atr(df, period):
+    prev_close = df["close"].shift(1)
+    tr = pd.concat(
+        [
+            df["high"] - df["low"],
+            (df["high"] - prev_close).abs(),
+            (df["low"] - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return tr.rolling(period).mean()
+
+
+def _completed(broker, symbol, interval, limit):
+    df = pd.DataFrame(broker.historical(symbol, interval, limit))
+    if len(df) < 2:
+        return df
+    # The last Binance kline may still be forming. Signals use completed bars only.
+    return df.iloc[:-1].copy().reset_index(drop=True)
+
+
+def _regime_ok(broker):
+    cfg = RULES["strategy"]
+    df = _completed(
+        broker,
+        cfg["regime_symbol"],
+        cfg["regime_timeframe"],
+        cfg["regime_ema_slow"] + 30,
+    )
+    if len(df) < cfg["regime_ema_slow"] + 5:
+        return False
+    fast = ema(df["close"], cfg["regime_ema_fast"])
+    slow = ema(df["close"], cfg["regime_ema_slow"])
+    return bool(df.iloc[-1]["close"] > slow.iloc[-1] and fast.iloc[-1] > slow.iloc[-1])
 
 
 def entry_signal(broker, symbol):
-    """Return an entry signal dict when all configured breakout conditions pass."""
-    cfg = RULES["entry"]
-    daily_ctx = _daily_context(broker, symbol)
-    if daily_ctx is None:
+    """Crypto-native multi-timeframe breakout signal.
+
+    4H BTC regime -> 1H trend -> 15M breakout + volume + ATR extension filter.
+    The returned stop is volatility-based, not based on a stock-market daily low.
+    """
+    cfg = RULES["strategy"]
+    if symbol == cfg["regime_symbol"]:
+        # BTC can trade this strategy too; the regime still evaluates BTC itself.
+        pass
+
+    if not _regime_ok(broker):
         return None
 
-    bars = pd.DataFrame(broker.historical(symbol, cfg.get("timeframe", "5m"), 100))
-    if len(bars) < 25:
+    trend = _completed(broker, symbol, cfg["trend_timeframe"], cfg["trend_ema_slow"] + 30)
+    entry = _completed(
+        broker,
+        symbol,
+        cfg["entry_timeframe"],
+        max(cfg["breakout_lookback"] + cfg["atr_period"] + 5, 60),
+    )
+    if len(trend) < cfg["trend_ema_slow"] + 5 or len(entry) < cfg["breakout_lookback"] + cfg["atr_period"] + 2:
         return None
 
-    current = bars.iloc[-1]
-    previous_bars = bars.iloc[:-1]
-    prior_intraday_high = float(previous_bars["high"].tail(20).max())
-    avg_volume = float(previous_bars["volume"].tail(20).mean())
+    trend_fast = ema(trend["close"], cfg["trend_ema_fast"])
+    trend_slow = ema(trend["close"], cfg["trend_ema_slow"])
+    trend_close = float(trend.iloc[-1]["close"])
+    if not (trend_close > trend_fast.iloc[-1] and trend_fast.iloc[-1] > trend_slow.iloc[-1]):
+        return None
+
+    entry["atr"] = atr(entry, cfg["atr_period"])
+    current = entry.iloc[-1]
+    previous = entry.iloc[:-1]
+    if pd.isna(current["atr"]):
+        return None
+
+    breakout_level = float(previous["high"].tail(cfg["breakout_lookback"]).max())
+    avg_volume = float(previous["volume"].tail(cfg["volume_lookback"]).mean())
     if avg_volume <= 0:
         return None
 
     price = float(current["close"])
+    current_atr = float(current["atr"])
     relative_volume = float(current["volume"]) / avg_volume
+    extension = price - breakout_level
 
-    if cfg.get("require_previous_day_high", True) and price <= daily_ctx["previous_high"]:
+    if price <= breakout_level:
         return None
-    if cfg.get("require_previous_close_above_sma200", True) and daily_ctx["previous_close"] <= daily_ctx["sma200"]:
+    if relative_volume < cfg["relative_volume_min"]:
         return None
-    if cfg.get("require_price_above_day_high", True) and price <= daily_ctx["previous_high"]:
-        return None
-    if cfg.get("require_breakout_above_prior_intraday_high", True) and price <= prior_intraday_high:
-        return None
-    if relative_volume < cfg.get("relative_volume_min", 1.5):
+    if extension > cfg["max_extension_atr"] * current_atr:
         return None
 
-    # Current day's low is used for the configured protective stop.
-    day = pd.DataFrame(broker.historical(symbol, "1d", 2))
-    if day.empty:
+    stop = price - cfg["stop_atr_multiple"] * current_atr
+    if stop <= 0 or stop >= price:
         return None
-    day_low = float(day.iloc[-1]["low"])
 
     return {
         "symbol": symbol,
         "price": price,
-        "day_low": day_low,
+        "stop": stop,
+        "atr": current_atr,
+        "breakout_level": breakout_level,
         "relative_volume": relative_volume,
-        "previous_high": daily_ctx["previous_high"],
-        "sma200": daily_ctx["sma200"],
+        "trend_ema_fast": float(trend_fast.iloc[-1]),
+        "trend_ema_slow": float(trend_slow.iloc[-1]),
     }
