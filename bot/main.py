@@ -41,6 +41,13 @@ def trade_cycle(manager, broker, trades_today):
     except FileNotFoundError:
         log.warning("No watchlist. Run the scan first.")
         return trades_today
+    except pd.errors.EmptyDataError:
+        log.info("Watchlist is empty; no candidates to evaluate.")
+        return trades_today
+
+    if "symbol" not in watch.columns or watch.empty:
+        log.info("Watchlist contains no candidates.")
+        return trades_today
 
     max_trades = RULES["entry"]["max_daily_trades"]
     max_positions = RULES["entry"]["max_concurrent_positions"]
@@ -87,7 +94,6 @@ def run_bot(interval_seconds=30):
                 day_key = now.date()
                 trades_today = 0
 
-            # Refresh the candidate list each cycle so the bot reacts to new conditions.
             try:
                 symbols = CryptoUniverse(broker).symbols()
                 rows = gap_scan(broker, symbols)
