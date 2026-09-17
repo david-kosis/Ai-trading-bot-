@@ -12,7 +12,9 @@ import requests
 
 from .config import RULES
 
-PUBLIC_URL = "https://testnet.binance.vision/api/v3/klines"
+# Backtests use Binance production's public market-data endpoint only; no API key
+# and no order endpoint are used. Trading remains on Spot Testnet separately.
+PUBLIC_URL = "https://api.binance.com/api/v3/klines"
 
 
 @dataclass
