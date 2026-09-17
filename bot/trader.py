@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 
 from .config import RULES, SETTINGS
-from .risk import position_size, stop_from_day_low
+from .risk import position_size
 from .database import log_event
 from .notify import send
 
@@ -11,9 +11,8 @@ class TradeManager:
         self.broker = broker
         self.active = {}
 
-    def enter(self, symbol, price, day_low):
+    def enter(self, symbol, price, stop):
         equity = self.broker.account_equity()
-        stop = stop_from_day_low(day_low)
         qty = position_size(equity, price, stop)
         qty = self.broker.normalize_quantity(symbol, qty)
         if qty <= 0:
@@ -21,7 +20,8 @@ class TradeManager:
             return None
 
         order = self.broker.market_order(symbol, qty, "BUY")
-        filled_price = float(order.get("fills", [{}])[0].get("price", price)) if order.get("fills") else price
+        fills = order.get("fills") or []
+        filled_price = float(fills[0].get("price", price)) if fills else price
         risk_per_unit = abs(filled_price - stop)
         target = filled_price + risk_per_unit * RULES["risk"]["partial_profit_r"]
         trade = {
@@ -42,29 +42,34 @@ class TradeManager:
         return trade
 
     def manage(self):
-        """Poll active testnet positions and execute configured exits."""
+        """Poll active positions and apply stop, partial, breakeven and trailing logic."""
         risk = RULES["risk"]
+        strategy = RULES["strategy"]
         for symbol, trade in list(self.active.items()):
             try:
                 price = self.broker.last_price(symbol)
                 trade["highest"] = max(trade["highest"], price)
-                initial_risk = abs(trade["entry"] - trade["stop"])
+                initial_risk = abs(trade["entry"] - trade["stop"]) if not trade["breakeven"] else abs(trade["entry"] - trade.get("initial_stop", trade["entry"]))
+                if "initial_stop" not in trade:
+                    trade["initial_stop"] = trade["stop"]
+                    initial_risk = abs(trade["entry"] - trade["initial_stop"])
                 if initial_risk <= 0:
                     continue
                 r = (price - trade["entry"]) / initial_risk
 
-                # Protective stop: market exit for this running process.
                 if price <= trade["stop"]:
-                    self.broker.close_position(symbol, self.broker.normalize_quantity(symbol, trade["remaining_qty"]))
+                    qty = self.broker.normalize_quantity(symbol, trade["remaining_qty"])
+                    if qty > 0:
+                        self.broker.close_position(symbol, qty)
                     log_event("stop_exit", symbol, {"price": price, "qty": trade["remaining_qty"]})
                     send(f"STOP EXIT {symbol} price={price:.6f}")
                     del self.active[symbol]
                     continue
 
-                # Take configured partial profit at 1R.
                 if not trade["partial_taken"] and r >= risk["partial_profit_r"]:
-                    partial_qty = trade["remaining_qty"] * risk["partial_profit_percent"] / 100
-                    partial_qty = self.broker.normalize_quantity(symbol, partial_qty)
+                    partial_qty = self.broker.normalize_quantity(
+                        symbol, trade["remaining_qty"] * risk["partial_profit_percent"] / 100
+                    )
                     if partial_qty > 0:
                         self.broker.close_position(symbol, partial_qty)
                         trade["remaining_qty"] -= partial_qty
@@ -78,11 +83,24 @@ class TradeManager:
                     log_event("breakeven", symbol, {"stop": trade["stop"], "r": r})
 
                 if r >= risk["trail_after_r"]:
-                    trail_distance = initial_risk
-                    new_stop = trade["highest"] - trail_distance
-                    if new_stop > trade["stop"]:
-                        trade["stop"] = new_stop
-                        log_event("trail_update", symbol, {"stop": new_stop, "r": r})
+                    atr_value = None
+                    try:
+                        bars = self.broker.historical(symbol, strategy["entry_timeframe"], strategy["atr_period"] + 2)
+                        if len(bars) > strategy["atr_period"]:
+                            highs = [float(x["high"]) for x in bars]
+                            lows = [float(x["low"]) for x in bars]
+                            closes = [float(x["close"]) for x in bars]
+                            trs = []
+                            for i in range(1, len(bars)):
+                                trs.append(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1])))
+                            atr_value = sum(trs[-strategy["atr_period"]:]) / strategy["atr_period"]
+                    except Exception:
+                        atr_value = None
+                    if atr_value:
+                        new_stop = trade["highest"] - strategy["trail_atr_multiple"] * atr_value
+                        if new_stop > trade["stop"]:
+                            trade["stop"] = new_stop
+                            log_event("trail_update", symbol, {"stop": new_stop, "r": r})
 
             except Exception as exc:
                 log_event("position_management_error", symbol, {"error": str(exc)})
