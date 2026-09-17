@@ -2,32 +2,44 @@
   "universe": {
     "min_price": 0.05,
     "min_avg_dollar_volume": 20000000,
-    "gap_percent_min": 3.0,
-    "max_candidates": 25
+    "max_candidates": 50,
+    "quote_asset": "USDT"
+  },
+  "strategy": {
+    "regime_symbol": "BTCUSDT",
+    "regime_timeframe": "4h",
+    "regime_ema_fast": 50,
+    "regime_ema_slow": 200,
+    "trend_timeframe": "1h",
+    "trend_ema_fast": 20,
+    "trend_ema_slow": 50,
+    "entry_timeframe": "15m",
+    "breakout_lookback": 20,
+    "volume_lookback": 20,
+    "relative_volume_min": 1.5,
+    "atr_period": 14,
+    "max_extension_atr": 0.5,
+    "stop_atr_multiple": 1.5,
+    "time_stop_bars": 12
   },
   "entry": {
-    "timeframe": "5m",
     "max_daily_trades": 5,
-    "max_concurrent_positions": 3,
-    "relative_volume_min": 1.5,
-    "require_previous_day_high": true,
-    "require_previous_close_above_sma200": true,
-    "require_price_above_day_high": true,
-    "require_breakout_above_prior_intraday_high": true
+    "max_concurrent_positions": 3
   },
   "risk": {
     "risk_per_trade_percent": 0.5,
     "max_daily_loss_percent": 2.0,
-    "stop_below_day_low_percent": 0.25,
     "partial_profit_r": 1.0,
     "partial_profit_percent": 50,
     "breakeven_at_r": 1.0,
-    "trail_after_r": 1.5,
-    "force_exit_time_utc": null
+    "trail_after_r": 2.0,
+    "trail_atr_multiple": 2.0,
+    "max_consecutive_losses": 2,
+    "cooldown_minutes": 60
   },
-  "data": {
-    "bar_minutes": 5,
-    "lookback_days": 30,
-    "opening_range_minutes": 5
+  "backtest": {
+    "fee_rate": 0.001,
+    "slippage_rate": 0.0005,
+    "initial_equity": 10000.0
   }
 }
