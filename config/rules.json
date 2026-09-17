@@ -1,19 +1,18 @@
 {
   "universe": {
-    "min_price": 5.0,
+    "min_price": 0.05,
     "min_avg_dollar_volume": 20000000,
     "gap_percent_min": 3.0,
     "max_candidates": 25
   },
   "entry": {
-    "start_time_et": "09:35",
-    "end_time_et": "11:30",
+    "timeframe": "5m",
     "max_daily_trades": 5,
     "max_concurrent_positions": 3,
     "relative_volume_min": 1.5,
-    "require_prior_day_high": true,
-    "require_prior_close_above_sma200": true,
-    "require_price_above_premarket_high": true,
+    "require_previous_day_high": true,
+    "require_previous_close_above_sma200": true,
+    "require_price_above_day_high": true,
     "require_breakout_above_prior_intraday_high": true
   },
   "risk": {
@@ -24,7 +23,7 @@
     "partial_profit_percent": 50,
     "breakeven_at_r": 1.0,
     "trail_after_r": 1.5,
-    "force_exit_time_et": "15:55"
+    "force_exit_time_utc": null
   },
   "data": {
     "bar_minutes": 5,
