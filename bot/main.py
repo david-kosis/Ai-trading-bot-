@@ -2,6 +2,7 @@ import argparse
 import logging
 import time
 from datetime import datetime, timezone
+
 import pandas as pd
 
 from .logging_setup import setup_logging
@@ -24,11 +25,12 @@ def scan():
         rows = gap_scan(broker, symbols)
         save_watchlist(rows)
         log_event("watchlist", payload={"count": len(rows), "symbols": [x["symbol"] for x in rows]})
-        message = "BINANCE WATCHLIST READY\n" + "\n".join(
-            f'{x["symbol"]} gap={x["gap_pct"]:.2f}%' for x in rows
+        message = "BINANCE LIQUID WATCHLIST READY\n" + "\n".join(
+            f'{x["symbol"]} 24h_volume={x["quote_volume_24h"]:.0f} change={x["change_pct_24h"]:.2f}%'
+            for x in rows
         )
         send(message)
-        log.info("Scanned %s symbols; %s candidates", len(symbols), len(rows))
+        log.info("Ranked %s liquid symbols; watchlist contains %s", len(symbols), len(rows))
         return rows
     finally:
         broker.disconnect()
@@ -67,7 +69,7 @@ def trade_cycle(manager, broker, trades_today):
             if not signal:
                 continue
             log_event("entry_signal", symbol, signal)
-            trade = manager.enter(symbol, signal["price"], signal["day_low"])
+            trade = manager.enter(symbol, signal["price"], signal["stop"])
             if trade:
                 trades_today += 1
                 log.info("Entered %s; trades_today=%s", symbol, trades_today)
@@ -79,7 +81,7 @@ def trade_cycle(manager, broker, trades_today):
 
 
 def run_bot(interval_seconds=30):
-    """Continuously scan and trade Binance Spot Testnet while paper mode is enabled."""
+    """Continuously scan and evaluate the crypto-native strategy."""
     broker = BinanceBroker("execution")
     manager = TradeManager(broker)
     trades_today = 0
