@@ -66,4 +66,6 @@ def gap_scan(broker, symbols):
 
 
 def save_watchlist(rows, path="data/watchlist.csv"):
-    pd.DataFrame(rows).to_csv(path, index=False)
+    # Always write CSV headers, even when no symbols qualify.
+    columns = ["symbol", "gap_pct", "prev_close", "open", "day_high", "day_low", "volume"]
+    pd.DataFrame(rows, columns=columns).to_csv(path, index=False)
