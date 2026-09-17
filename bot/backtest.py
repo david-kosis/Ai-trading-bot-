@@ -1,13 +1,4 @@
-"""Research backtester for the crypto-native breakout strategy.
-
-Usage examples:
-  python -m bot.backtest --symbol ETHUSDT --days 90
-  python -m bot.backtest --symbol SOLUSDT --days 180 --interval 15m
-
-The backtester downloads public Binance klines, builds 1H/4H context from
-15-minute data, enters on the next bar open, models fees and slippage, and
-reports equity, drawdown and trade statistics. It is research tooling only.
-"""
+"""Research backtester for the crypto-native breakout strategy."""
 
 import argparse
 import math
@@ -33,18 +24,22 @@ class Position:
     stop: float
     risk_per_unit: float
     highest: float
+    entry_time: pd.Timestamp
+    realized_pnl: float = 0.0
     partial_taken: bool = False
-    entry_time: pd.Timestamp | None = None
 
 
 def fetch_klines(symbol, interval, days):
-    """Download public historical klines in Binance's 1000-row pages."""
+    """Download public Binance klines in 1000-row pages."""
     end = int(datetime.now(timezone.utc).timestamp() * 1000)
     start = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000)
     rows = []
     while start < end:
-        params = {"symbol": symbol, "interval": interval, "startTime": start, "endTime": end, "limit": 1000}
-        response = requests.get(PUBLIC_URL, params=params, timeout=20)
+        response = requests.get(
+            PUBLIC_URL,
+            params={"symbol": symbol, "interval": interval, "startTime": start, "endTime": end, "limit": 1000},
+            timeout=20,
+        )
         response.raise_for_status()
         batch = response.json()
         if not batch:
@@ -59,8 +54,8 @@ def fetch_klines(symbol, interval, days):
         time.sleep(0.05)
 
     df = pd.DataFrame(rows, columns=[
-        "open_time", "open", "high", "low", "close", "volume",
-        "close_time", "quote_volume", "trades", "taker_base", "taker_quote", "ignore",
+        "open_time", "open", "high", "low", "close", "volume", "close_time",
+        "quote_volume", "trades", "taker_base", "taker_quote", "ignore",
     ])
     if df.empty:
         raise RuntimeError(f"No historical data returned for {symbol}")
@@ -76,8 +71,8 @@ def resample_ohlcv(df, rule):
     }).dropna()
 
 
-def ema(s, period):
-    return s.ewm(span=period, adjust=False).mean()
+def ema(series, period):
+    return series.ewm(span=period, adjust=False).mean()
 
 
 def atr(df, period):
@@ -119,7 +114,6 @@ def signal_at(ts, symbol_df, btc_df):
     previous = e.iloc[:-1]
     if pd.isna(current["atr"]):
         return None
-
     breakout = previous["high"].tail(cfg["breakout_lookback"]).max()
     avg_volume = previous["volume"].tail(cfg["volume_lookback"]).mean()
     price = float(current["close"])
@@ -139,12 +133,12 @@ def run_backtest(symbol, days):
     cfg = RULES["strategy"]
     risk_cfg = RULES["risk"]
     bt_cfg = RULES["backtest"]
-    equity = float(bt_cfg["initial_equity"])
-    peak = equity
+    cash = float(bt_cfg["initial_equity"])
+    peak_equity = cash
     max_dd = 0.0
     position = None
     trades = []
-    daily_start = equity
+    daily_start = cash
     daily_pnl = 0.0
     daily_key = None
     trades_today = 0
@@ -154,25 +148,25 @@ def run_backtest(symbol, days):
     data = fetch_klines(symbol, cfg["entry_timeframe"], days)
     btc = fetch_klines(cfg["regime_symbol"], cfg["entry_timeframe"], days)
     common = data.index.intersection(btc.index)
-    data = data.loc[common]
-    btc = btc.loc[common]
+    data, btc = data.loc[common], btc.loc[common]
     if len(data) < 1000:
         raise RuntimeError("Not enough overlapping data for this backtest window")
 
     fee = float(bt_cfg["fee_rate"])
     slip = float(bt_cfg["slippage_rate"])
 
+    def mark_equity(last_price):
+        return cash if position is None else cash + position.qty * last_price
+
     for i in range(1, len(data)):
         ts = data.index[i]
         bar = data.iloc[i]
-        day = ts.date()
-        if day != daily_key:
-            daily_key = day
-            daily_start = equity
+        if ts.date() != daily_key:
+            daily_key = ts.date()
+            daily_start = mark_equity(float(bar.close))
             daily_pnl = 0.0
             trades_today = 0
 
-        # Manage existing position using this bar's OHLC.
         if position is not None:
             position.highest = max(position.highest, float(bar.high))
             exit_price = None
@@ -185,11 +179,10 @@ def run_backtest(symbol, days):
                 r_high = (float(bar.high) - position.entry) / position.risk_per_unit
                 if not position.partial_taken and r_high >= risk_cfg["partial_profit_r"]:
                     partial_qty = position.qty * risk_cfg["partial_profit_percent"] / 100
-                    fill = position.entry + position.risk_per_unit * risk_cfg["partial_profit_r"]
-                    fill *= 1 - slip
+                    fill = (position.entry + position.risk_per_unit * risk_cfg["partial_profit_r"]) * (1 - slip)
                     proceeds = partial_qty * fill
-                    fee_paid = proceeds * fee
-                    equity += proceeds - fee_paid
+                    cash += proceeds - proceeds * fee
+                    position.realized_pnl += (fill - position.entry) * partial_qty - proceeds * fee
                     position.qty -= partial_qty
                     position.partial_taken = True
                     position.stop = max(position.stop, position.entry)
@@ -198,11 +191,9 @@ def run_backtest(symbol, days):
                     position.stop = max(position.stop, position.entry)
 
                 if r_high >= risk_cfg["trail_after_r"]:
-                    # Use ATR from data available up to this bar only.
-                    local = data.iloc[: i + 1]
-                    a = float(atr(local, cfg["atr_period"]).iloc[-1])
-                    new_stop = position.highest - risk_cfg["trail_atr_multiple"] * a
-                    position.stop = max(position.stop, new_stop)
+                    a = float(atr(data.iloc[: i + 1], cfg["atr_period"]).iloc[-1])
+                    if not math.isnan(a):
+                        position.stop = max(position.stop, position.highest - risk_cfg["trail_atr_multiple"] * a)
 
                 if float(bar.close) <= position.stop:
                     exit_price = position.stop * (1 - slip)
@@ -210,9 +201,8 @@ def run_backtest(symbol, days):
 
             if exit_price is not None:
                 proceeds = position.qty * exit_price
-                fee_paid = proceeds * fee
-                equity += proceeds - fee_paid
-                pnl = (exit_price - position.entry) * position.qty
+                cash += proceeds - proceeds * fee
+                pnl = position.realized_pnl + (exit_price - position.entry) * position.qty - proceeds * fee
                 daily_pnl += pnl
                 trades.append({"entry_time": position.entry_time, "exit_time": ts, "pnl": pnl, "reason": exit_reason})
                 if pnl < 0:
@@ -223,7 +213,6 @@ def run_backtest(symbol, days):
                     consecutive_losses = 0
                 position = None
 
-        # Signal at close; execute at next bar open, so no lookahead.
         if position is None and i + 1 < len(data):
             if trades_today >= RULES["entry"]["max_daily_trades"]:
                 continue
@@ -237,25 +226,25 @@ def run_backtest(symbol, days):
                 risk_per_unit = next_open - signal["stop"]
                 if risk_per_unit <= 0:
                     continue
-                risk_cash = equity * risk_cfg["risk_per_trade_percent"] / 100
+                risk_cash = cash * risk_cfg["risk_per_trade_percent"] / 100
                 qty = risk_cash / risk_per_unit
                 notional = qty * next_open
                 entry_fee = notional * fee
-                if notional + entry_fee >= equity or qty <= 0:
+                if notional + entry_fee >= cash or qty <= 0:
                     continue
-                equity -= entry_fee
-                position = Position(symbol, qty, next_open, signal["stop"], signal["stop"], risk_per_unit, next_open, entry_time=data.index[i + 1])
+                cash -= notional + entry_fee
+                position = Position(symbol, qty, next_open, signal["stop"], signal["stop"], risk_per_unit, next_open, data.index[i + 1])
                 trades_today += 1
 
-        peak = max(peak, equity)
-        max_dd = max(max_dd, (peak - equity) / peak if peak else 0)
+        current_equity = mark_equity(float(bar.close))
+        peak_equity = max(peak_equity, current_equity)
+        max_dd = max(max_dd, (peak_equity - current_equity) / peak_equity if peak_equity else 0)
 
     if position is not None:
-        last = data.iloc[-1]
-        exit_price = float(last["close"]) * (1 - slip)
-        proceeds = position.qty * exit_price
-        equity += proceeds - proceeds * fee
-        pnl = (exit_price - position.entry) * position.qty
+        last_price = float(data.iloc[-1]["close"]) * (1 - slip)
+        proceeds = position.qty * last_price
+        cash += proceeds - proceeds * fee
+        pnl = position.realized_pnl + (last_price - position.entry) * position.qty - proceeds * fee
         trades.append({"entry_time": position.entry_time, "exit_time": data.index[-1], "pnl": pnl, "reason": "end_of_test"})
 
     pnls = np.array([t["pnl"] for t in trades], dtype=float)
@@ -267,8 +256,8 @@ def run_backtest(symbol, days):
         "symbol": symbol,
         "days": days,
         "initial_equity": bt_cfg["initial_equity"],
-        "final_equity": round(equity, 2),
-        "return_pct": round((equity / bt_cfg["initial_equity"] - 1) * 100, 2),
+        "final_equity": round(cash, 2),
+        "return_pct": round((cash / bt_cfg["initial_equity"] - 1) * 100, 2),
         "max_drawdown_pct": round(max_dd * 100, 2),
         "trades": len(trades),
         "win_rate_pct": round(win_rate * 100, 2),
